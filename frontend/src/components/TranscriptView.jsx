@@ -1,19 +1,42 @@
 import { useEffect, useRef, memo, useMemo } from 'react'
 
+// Apply corrections to sentence text
+function applyCorrections(text, corrections) {
+  if (!corrections || corrections.length === 0) return text
+
+  let result = text
+  // Sort corrections by original length (longest first) to avoid partial replacements
+  const sortedCorrections = [...corrections].sort((a, b) =>
+    (b.original?.length || 0) - (a.original?.length || 0)
+  )
+
+  for (const corr of sortedCorrections) {
+    if ((corr.status === 'accepted' || corr.status === 'rejected') && corr.final && corr.original) {
+      // Case-insensitive replacement while preserving surrounding text
+      const regex = new RegExp(corr.original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
+      result = result.replace(regex, corr.final)
+    }
+  }
+  return result
+}
+
 // Memoized sentence component to prevent unnecessary re-renders
 const SentenceBlock = memo(function SentenceBlock({
   sentence,
+  displaySpeaker,
   isCurrentSpeaker,
   isUnknown,
   isHighlighted,
   isPlaying,
   currentWordIndex,
   errorText,
+  sentenceCorrections,
   onSeek
 }) {
   // Split text into words and highlight the current one + error text
   const renderText = () => {
-    const text = sentence.text
+    // Apply accepted/rejected corrections to the text
+    const text = applyCorrections(sentence.text, sentenceCorrections)
 
     // Find error text position if applicable
     let errorStart = -1
@@ -86,7 +109,7 @@ const SentenceBlock = memo(function SentenceBlock({
         onClick={() => onSeek(sentence.start)}
         style={{ cursor: 'pointer' }}
       >
-        [{sentence.speaker}] {sentence.start?.toFixed(1)}s
+        [{displaySpeaker}] {sentence.start?.toFixed(1)}s
         {isUnknown && <span className="unknown-badge">UNKNOWN</span>}
       </span>
       <p className={`sentence-text ${isHighlighted ? 'highlighted' : ''}`}>
@@ -96,7 +119,7 @@ const SentenceBlock = memo(function SentenceBlock({
   )
 })
 
-function TranscriptView({ transcript, currentCorrection, currentSpeakerSuggestion, videoTime, wordChunk, onWordClick }) {
+function TranscriptView({ transcript, corrections, speakerNames, speakerSuggestions, currentCorrection, currentSpeakerSuggestion, scrollToSentenceId, videoTime, wordChunk, onWordClick }) {
   const containerRef = useRef(null)
   const scrollTargetRef = useRef(null)
   const lastScrollKeyRef = useRef('')
@@ -111,6 +134,34 @@ function TranscriptView({ transcript, currentCorrection, currentSpeakerSuggestio
     }
     return map
   }, [wordChunk])
+
+  // Build a map of sentence_id -> corrections for that sentence
+  const correctionsBySentence = useMemo(() => {
+    const map = {}
+    if (corrections) {
+      for (const corr of corrections) {
+        const sid = corr.sentence_id
+        if (sid != null) {
+          if (!map[sid]) map[sid] = []
+          map[sid].push(corr)
+        }
+      }
+    }
+    return map
+  }, [corrections])
+
+  // Build a map of sentence_id -> assigned speaker from decisions
+  const speakerDecisions = useMemo(() => {
+    const map = {}
+    if (speakerSuggestions) {
+      for (const suggestion of speakerSuggestions) {
+        if (suggestion.assigned_speaker && suggestion.decision) {
+          map[suggestion.sentence_id] = suggestion.assigned_speaker
+        }
+      }
+    }
+    return map
+  }, [speakerSuggestions])
 
   // Find current sentence and word based on videoTime
   const { playingSentenceId, currentWordIndex } = useMemo(() => {
@@ -151,9 +202,9 @@ function TranscriptView({ transcript, currentCorrection, currentSpeakerSuggestio
     return { playingSentenceId: null, currentWordIndex: -1 }
   }, [videoTime, wordChunk])
 
-  // Get the target sentence ID for scrolling
-  const scrollTargetId = currentCorrection?.sentence_id ?? currentSpeakerSuggestion?.sentence_id
-  const scrollKey = `${currentCorrection?.id ?? 'none'}-${scrollTargetId ?? 'none'}`
+  // Get the target sentence ID for scrolling (priority: explicit scroll request > current item)
+  const scrollTargetId = scrollToSentenceId ?? currentCorrection?.sentence_id ?? currentSpeakerSuggestion?.sentence_id
+  const scrollKey = `${scrollToSentenceId ?? 'none'}-${currentCorrection?.id ?? 'none'}-${currentSpeakerSuggestion?.id ?? 'none'}-${scrollTargetId ?? 'none'}`
 
   // Auto-scroll when correction/speaker changes
   useEffect(() => {
@@ -187,28 +238,42 @@ function TranscriptView({ transcript, currentCorrection, currentSpeakerSuggestio
       <div className="transcript-content">
         {transcript.sentences.map((sentence, idx) => {
           const isCurrentSpeaker = sentence.id === currentSpeakerSuggestion?.sentence_id
-          const isUnknown = sentence.was_unknown ||
-            (sentence.speaker && sentence.speaker.toUpperCase().includes('UNKNOWN'))
-          const isHighlighted = sentence.id === currentCorrection?.sentence_id
+          // Only show as unknown if it hasn't been reassigned
+          const hasDecision = speakerDecisions[sentence.id] != null
+          const isUnknown = !hasDecision && (sentence.was_unknown ||
+            (sentence.speaker && sentence.speaker.toUpperCase().includes('UNKNOWN')))
+          const isHighlighted = sentence.id === currentCorrection?.sentence_id || sentence.id === scrollToSentenceId
           const isPlaying = sentence.id === playingSentenceId
           const wordIdx = isPlaying ? currentWordIndex : -1
 
           // Get the error text (original) from the current correction if this is the highlighted sentence
           const errorText = isHighlighted ? currentCorrection?.original : null
 
+          // Get all corrections for this sentence
+          const sentenceCorrs = correctionsBySentence[sentence.id] || []
+
           // Set ref on the sentence that matches the current correction/speaker
           const isScrollTarget = sentence.id === scrollTargetId
+
+          // Check if this sentence was reassigned via a speaker decision
+          const effectiveSpeaker = speakerDecisions[sentence.id] || sentence.speaker
+          // Use assigned name if available, otherwise fall back to speaker ID
+          const displaySpeaker = speakerNames?.[effectiveSpeaker] || effectiveSpeaker
+          // Mark as reassigned if speaker changed
+          const wasReassigned = speakerDecisions[sentence.id] && speakerDecisions[sentence.id] !== sentence.speaker
 
           return (
             <div key={sentence.id ?? idx} ref={isScrollTarget ? scrollTargetRef : null}>
               <SentenceBlock
                 sentence={sentence}
+                displaySpeaker={displaySpeaker}
                 isCurrentSpeaker={isCurrentSpeaker}
                 isUnknown={isUnknown}
                 isHighlighted={isHighlighted}
                 isPlaying={isPlaying}
                 currentWordIndex={wordIdx}
                 errorText={errorText}
+                sentenceCorrections={sentenceCorrs}
                 onSeek={onWordClick}
               />
             </div>

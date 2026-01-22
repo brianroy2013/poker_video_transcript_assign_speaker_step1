@@ -33,6 +33,18 @@ KNOWN_TRANSITION_PHRASES = [
 MAX_MERGE_GAP_SECONDS = 2.0
 
 
+def parse_speaker_names(md_content):
+    """Parse speaker names section from markdown."""
+    speaker_names = {}
+    # Pattern: - SPEAKER_00: John
+    pattern = re.compile(r'^- (SPEAKER_\d+): (.+)$', re.MULTILINE)
+    for match in pattern.finditer(md_content):
+        speaker_id = match.group(1)
+        name = match.group(2).strip()
+        speaker_names[speaker_id] = name
+    return speaker_names
+
+
 def parse_corrections_markdown(md_content):
     """Parse the markdown corrections file into structured data."""
     corrections = []
@@ -48,11 +60,15 @@ def parse_corrections_markdown(md_content):
     )
 
     # Pattern for correction lines - handles various formats:
-    # Line 1: "Freezer frame" → "Freeze frame" ✓/✗
+    # Line 1: "Freezer frame" → "Freeze frame" ✓/✗  (pending)
+    # Line 1: "Freezer frame" → "Freeze frame" ✓    (accepted)
+    # Line 1: "Freezer frame" → "Freeze frame" ✗    (rejected, keep original)
+    # Line 1: "Freezer frame" → "Freeze frame" ✗ → "custom text"  (rejected with custom)
+    # Line 1: "Freezer frame" → "Freeze frame" [skipped]  (ignored)
     # Line 14: "check, queen suited" → ??? ✓/✗
     # Line 49: "Ace-King" → "AK" (all instances) ✓/✗
     correction_pattern = re.compile(
-        r'Line (\d+): "(.+?)" → (\?\?\?|"(.+?)")(?:\s*\([^)]+\))?\s*(✓/✗|✓|✗)(?:\s*→\s*"(.+?)")?'
+        r'Line (\d+): "(.+?)" → (\?\?\?|"(.+?)")(?:\s*\([^)]+\))?\s*(✓/✗|✓|✗|\[skipped\])(?:\s*→\s*"(.+?)")?'
     )
 
     for line in lines:
@@ -106,6 +122,9 @@ def parse_corrections_markdown(md_content):
                         final = custom_text
                     else:
                         final = original  # Keep original
+                elif status_marker == "[skipped]":
+                    status = "ignored"
+                    final = None
                 # ✓/✗ means pending (not yet decided)
 
                 corrections.append({
@@ -135,8 +154,9 @@ def detect_unknown_speakers(transcript):
     for i, sentence in enumerate(sentences):
         speaker = sentence.get('speaker', '')
 
-        # Check if this is an UNKNOWN speaker (was_unknown flag or speaker name pattern)
-        is_unknown = sentence.get('was_unknown', False) or 'UNKNOWN' in speaker.upper()
+        # Only flag sentences where the speaker field actually contains UNKNOWN
+        # (was_unknown flag alone is not enough - the speaker may have been assigned already)
+        is_unknown = 'UNKNOWN' in speaker.upper()
 
         if not is_unknown:
             continue
@@ -404,10 +424,19 @@ def load_video_data():
     video_name = video_path.stem
     video_dir = video_path.parent
 
-    # Find related files - look for any changelog variant
+    # Check for reviewed file first (to resume), then fall back to original
+    reviewed_dir = video_dir / "selected_ai_edits"
     corrections_dir = video_dir / "online_ai_suggested_edits"
     corrections_path = None
-    if corrections_dir.exists():
+
+    # First, look for a reviewed file to resume from
+    if reviewed_dir.exists():
+        for f in reviewed_dir.glob(f"{video_name}_changelog*_reviewed.md"):
+            corrections_path = f
+            break
+
+    # If no reviewed file, load from original
+    if not corrections_path and corrections_dir.exists():
         for f in corrections_dir.glob(f"{video_name}_changelog*.md"):
             corrections_path = f
             break
@@ -504,6 +533,9 @@ def load_video_data():
             if s.get('speaker') and 'UNKNOWN' not in s.get('speaker', '').upper()
         ))
 
+        # Parse speaker names from markdown
+        speaker_names = parse_speaker_names(corrections_md)
+
         return jsonify({
             "video_path": str(video_path),
             "corrections": corrections,
@@ -511,6 +543,7 @@ def load_video_data():
             "reviewed": reviewed,
             "unknown_speaker_suggestions": unknown_speaker_suggestions,
             "known_speakers": sorted(known_speakers),
+            "speaker_names": speaker_names,
             "corrections_path": str(corrections_path),
             "transcript_path": str(transcript_path),
             "reviewed_path": str(reviewed_path)
@@ -519,14 +552,160 @@ def load_video_data():
         return jsonify({"error": str(e)}), 500
 
 
+def update_markdown_with_decisions(md_path, corrections, output_dir, speaker_names=None):
+    """Create a reviewed markdown file with decisions (does not modify original)."""
+    with open(md_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # Add or update speaker names section at the top
+    speaker_section = ""
+    if speaker_names:
+        speaker_lines = ["## Speaker Names"]
+        for speaker_id, name in sorted(speaker_names.items()):
+            if name and name.strip():
+                speaker_lines.append(f"- {speaker_id}: {name}")
+        speaker_section = "\n".join(speaker_lines) + "\n\n"
+
+    # Remove existing speaker names section if present
+    content = re.sub(r'## Speaker Names\n(?:- [^\n]+\n)*\n?', '', content)
+
+    # Add speaker section at the top
+    content = speaker_section + content
+
+    # Build a map of line_id -> correction decision
+    decisions = {c.get('id'): c for c in corrections}
+
+    lines = content.split('\n')
+    updated_lines = []
+
+    for line in lines:
+        # Check if this is a correction line
+        if line.strip().startswith('Line '):
+            # Extract line number
+            match = re.match(r'Line (\d+):', line)
+            if match:
+                line_id = int(match.group(1))
+                decision = decisions.get(line_id)
+
+                if decision:
+                    status = decision.get('status')
+                    final = decision.get('final')
+                    original = decision.get('original', '')
+
+                    if status == 'accepted':
+                        # Replace ✓/✗ with just ✓
+                        line = re.sub(r'✓/✗', '✓', line)
+                    elif status == 'rejected':
+                        # Replace ✓/✗ with ✗ and add custom text if different
+                        if final and final != original:
+                            line = re.sub(r'✓/✗.*$', f'✗ → "{final}"', line)
+                        else:
+                            line = re.sub(r'✓/✗', '✗', line)
+                    elif status == 'ignored':
+                        # Replace ✓/✗ with [skipped]
+                        line = re.sub(r'✓/✗', '[skipped]', line)
+                    # pending items keep ✓/✗
+
+        updated_lines.append(line)
+
+    # Save to a NEW file in selected_ai_edits folder
+    output_dir.mkdir(exist_ok=True)
+    reviewed_filename = md_path.stem + '_reviewed.md'
+    reviewed_path = output_dir / reviewed_filename
+
+    with open(reviewed_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(updated_lines))
+
+    return reviewed_path
+
+
+def build_corrected_transcript(transcript, speaker_names, speaker_decisions, segment_splits=None):
+    """
+    Build a complete corrected transcript with speaker assignments applied.
+
+    Args:
+        transcript: Original transcript data from _v7.json
+        speaker_names: Dict mapping speaker IDs to names (e.g., {"SPEAKER_00": "Tommy"})
+        speaker_decisions: List of UNKNOWN speaker decisions with assigned_speaker
+        segment_splits: List of segment split markers (optional)
+
+    Returns:
+        List of sentences with speaker_name field and reassignments applied
+    """
+    if not transcript or 'sentences' not in transcript:
+        return []
+
+    # Build lookup maps for quick access
+    decision_map = {}
+    for decision in speaker_decisions:
+        if decision.get('decision') and decision.get('assigned_speaker'):
+            sentence_id = decision.get('sentence_id')
+            decision_map[sentence_id] = {
+                'decision': decision.get('decision'),
+                'assigned_speaker': decision.get('assigned_speaker')
+            }
+
+    split_map = {}
+    if segment_splits:
+        for split in segment_splits:
+            sentence_id = split.get('sentence_id')
+            if sentence_id is not None and split.get('new_speaker'):
+                split_map[sentence_id] = split.get('new_speaker')
+
+    corrected_sentences = []
+
+    for sentence in transcript.get('sentences', []):
+        sentence_id = sentence.get('id')
+        original_speaker = sentence.get('speaker', '')
+
+        # Start with a copy of the original sentence
+        corrected = dict(sentence)
+
+        # Determine the final speaker
+        final_speaker = original_speaker
+        was_reassigned = False
+        reassign_reason = None
+
+        # Check if this sentence has a segment split (takes precedence)
+        if sentence_id in split_map:
+            final_speaker = split_map[sentence_id]
+            was_reassigned = True
+            reassign_reason = 'segment_split'
+
+        # Check if this sentence has an UNKNOWN speaker decision
+        elif sentence_id in decision_map:
+            decision_info = decision_map[sentence_id]
+            final_speaker = decision_info['assigned_speaker']
+            was_reassigned = True
+            reassign_reason = decision_info['decision']
+
+        # Update the speaker if reassigned
+        if was_reassigned:
+            corrected['original_speaker'] = original_speaker
+            corrected['speaker'] = final_speaker
+            corrected['reassign_reason'] = reassign_reason
+
+        # Add speaker_name field
+        corrected['speaker_name'] = speaker_names.get(final_speaker, final_speaker)
+
+        # Track if this was originally an UNKNOWN speaker
+        corrected['was_unknown'] = 'UNKNOWN' in original_speaker.upper()
+
+        corrected_sentences.append(corrected)
+
+    return corrected_sentences
+
+
 @app.route('/api/save', methods=['POST'])
 def save_reviewed():
-    """Save reviewed corrections and speaker decisions to file."""
+    """Save reviewed corrections to markdown and speaker decisions to JSON."""
     data = request.json
 
     video_path = data.get('video_path')
     corrections = data.get('corrections', [])
     speaker_decisions = data.get('speaker_decisions', [])
+    speaker_names = data.get('speaker_names', {})
+    segment_splits = data.get('segment_splits', [])
 
     if not video_path:
         return jsonify({"error": "Missing video path"}), 400
@@ -535,11 +714,20 @@ def save_reviewed():
     video_name = video_path.stem
     video_dir = video_path.parent
 
-    # Create output directory
-    output_dir = video_dir / "selected_ai_edits"
-    output_dir.mkdir(exist_ok=True)
+    # Find the corrections markdown file
+    corrections_dir = video_dir / "online_ai_suggested_edits"
+    md_path = None
+    if corrections_dir.exists():
+        for f in corrections_dir.glob(f"{video_name}_changelog*.md"):
+            md_path = f
+            break
 
-    reviewed_path = output_dir / f"{video_name}_reviewed.json"
+    # Load original transcript for building complete corrected version
+    transcript_path = video_dir / "transcription_v7" / f"{video_name}_v7.json"
+    original_transcript = None
+    if transcript_path.exists():
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            original_transcript = json.load(f)
 
     # Calculate correction statistics
     correction_stats = {
@@ -556,27 +744,81 @@ def save_reviewed():
         "merge_before": sum(1 for s in speaker_decisions if s.get("decision") == "merge_before"),
         "merge_after": sum(1 for s in speaker_decisions if s.get("decision") == "merge_after"),
         "keep_separate": sum(1 for s in speaker_decisions if s.get("decision") == "keep_separate"),
+        "assigned": sum(1 for s in speaker_decisions if s.get("decision") == "assign"),
         "pending": sum(1 for s in speaker_decisions if s.get("status") == "pending")
     }
 
-    reviewed_data = {
-        "source_video": str(video_path),
-        "reviewed_at": datetime.now().isoformat(),
-        "correction_statistics": correction_stats,
-        "speaker_statistics": speaker_stats,
-        "corrections": corrections,
-        "speaker_decisions": speaker_decisions
-    }
-
     try:
-        with open(reviewed_path, 'w', encoding='utf-8') as f:
-            json.dump(reviewed_data, f, indent=2, ensure_ascii=False)
+        output_dir = video_dir / "selected_ai_edits"
+        output_dir.mkdir(exist_ok=True)
+
+        # Create reviewed markdown file (does NOT modify original)
+        reviewed_md_path = None
+        if md_path and md_path.exists():
+            reviewed_md_path = update_markdown_with_decisions(md_path, corrections, output_dir, speaker_names)
+
+        # Create JSON file with speaker names and text changes (legacy format)
+        json_path = output_dir / f"{video_name}_reviewed.json"
+
+        # Extract only the corrections that have changes (accepted or rejected)
+        text_changes = []
+        for c in corrections:
+            if c.get("status") in ("accepted", "rejected") and c.get("final"):
+                text_changes.append({
+                    "id": c.get("id"),
+                    "sentence_id": c.get("sentence_id"),
+                    "original": c.get("original"),
+                    "corrected": c.get("final"),
+                    "status": c.get("status")
+                })
+
+        json_data = {
+            "source_video": str(video_path),
+            "reviewed_at": datetime.now().isoformat(),
+            "speaker_names": speaker_names,
+            "text_changes": text_changes,
+            "speaker_decisions": speaker_decisions,
+            "correction_statistics": correction_stats,
+            "speaker_statistics": speaker_stats
+        }
+
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+
+        # Create complete corrected transcript with speaker assignments (_speakers.json)
+        speakers_json_path = output_dir / f"{video_name}_speakers.json"
+
+        if original_transcript:
+            # Build corrected sentences with speaker names and reassignments applied
+            corrected_sentences = build_corrected_transcript(
+                original_transcript,
+                speaker_names,
+                speaker_decisions,
+                segment_splits
+            )
+
+            speakers_data = {
+                "source_video": str(video_path),
+                "assigned_at": datetime.now().isoformat(),
+                "speaker_names": speaker_names,
+                "statistics": {
+                    "total_sentences": len(corrected_sentences),
+                    "speakers_assigned": len(speaker_names),
+                    "unknown_resolved": sum(1 for s in corrected_sentences if s.get('was_unknown') and s.get('reassign_reason')),
+                    "segment_splits": len(segment_splits) if segment_splits else 0
+                },
+                "sentences": corrected_sentences
+            }
+
+            with open(speakers_json_path, 'w', encoding='utf-8') as f:
+                json.dump(speakers_data, f, indent=2, ensure_ascii=False)
 
         return jsonify({
             "success": True,
-            "path": str(reviewed_path),
-            "correction_statistics": correction_stats,
-            "speaker_statistics": speaker_stats
+            "markdown_path": str(reviewed_md_path) if reviewed_md_path else None,
+            "json_path": str(json_path),
+            "speakers_json_path": str(speakers_json_path) if original_transcript else None,
+            "correction_statistics": correction_stats
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -5,9 +5,9 @@ function Header({
   reviewPhase,
   onPhaseSwitch,
   hasSpeakerSuggestions,
+  speakerNamesComplete,
   onBrowse,
   onSave,
-  onExport,
   saveStatus
 }) {
   const videoName = videoPath ? videoPath.split(/[/\\]/).pop() : ''
@@ -26,10 +26,10 @@ function Header({
       <div className="header-center">
         <div className="phase-tabs">
           <button
-            className={`phase-tab ${reviewPhase === 'corrections' ? 'active' : ''}`}
-            onClick={() => onPhaseSwitch('corrections')}
+            className={`phase-tab ${reviewPhase === 'assign-names' ? 'active' : ''} ${speakerNamesComplete ? 'completed' : ''}`}
+            onClick={() => onPhaseSwitch('assign-names')}
           >
-            Text Corrections
+            Assign Names {speakerNamesComplete && '✓'}
           </button>
           {hasSpeakerSuggestions && (
             <button
@@ -39,6 +39,12 @@ function Header({
               Speaker Review
             </button>
           )}
+          <button
+            className={`phase-tab ${reviewPhase === 'corrections' ? 'active' : ''}`}
+            onClick={() => onPhaseSwitch('corrections')}
+          >
+            Text Corrections
+          </button>
         </div>
 
         <div className="progress-section">
@@ -61,9 +67,6 @@ function Header({
           disabled={saveStatus === 'saving'}
         >
           {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved!' : 'Save'}
-        </button>
-        <button className="btn btn-success" onClick={onExport}>
-          Export
         </button>
       </div>
     </header>

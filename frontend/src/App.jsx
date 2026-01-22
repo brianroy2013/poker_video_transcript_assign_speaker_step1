@@ -3,6 +3,7 @@ import Header from './components/Header'
 import VideoPlayer from './components/VideoPlayer'
 import CorrectionPanel from './components/CorrectionPanel'
 import UnknownSpeakerPanel from './components/UnknownSpeakerPanel'
+import AssignSpeakersPanel from './components/AssignSpeakersPanel'
 import TranscriptView from './components/TranscriptView'
 import NavigationBar from './components/NavigationBar'
 import RejectDialog from './components/RejectDialog'
@@ -20,8 +21,15 @@ function App() {
   const [transcript, setTranscript] = useState(null)
   const [currentIndex, setCurrentIndex] = useState(0)
 
-  // Two-phase review: 'corrections' or 'speakers'
-  const [reviewPhase, setReviewPhase] = useState('corrections')
+  // Speaker name assignments (SPEAKER_00 -> "John", etc.)
+  const [speakerNames, setSpeakerNames] = useState({})
+  const [speakerNamesComplete, setSpeakerNamesComplete] = useState(false)
+
+  // For scrolling transcript to a specific sentence
+  const [scrollToSentenceId, setScrollToSentenceId] = useState(null)
+
+  // Three-phase review: 'assign-names', 'speakers', or 'corrections'
+  const [reviewPhase, setReviewPhase] = useState('assign-names')
 
   // UI state
   const [showFileBrowser, setShowFileBrowser] = useState(true)
@@ -39,7 +47,8 @@ function App() {
   const chunkFetchingRef = useRef(false)
 
   // Get current items based on phase
-  const currentItems = reviewPhase === 'corrections' ? corrections : speakerSuggestions
+  const currentItems = reviewPhase === 'corrections' ? corrections :
+                       reviewPhase === 'speakers' ? speakerSuggestions : []
   const currentItem = currentItems[currentIndex] || null
 
   // Calculate statistics for corrections
@@ -79,20 +88,41 @@ function App() {
       setKnownSpeakers(data.known_speakers || [])
 
       // Load corrections
-      if (data.reviewed && data.reviewed.corrections) {
-        setCorrections(data.reviewed.corrections)
-        const firstPending = data.reviewed.corrections.findIndex(c => c.status === 'pending')
-        setCurrentIndex(firstPending >= 0 ? firstPending : 0)
-      } else {
-        setCorrections(data.corrections)
-        setCurrentIndex(0)
-      }
+      setCorrections(data.corrections)
 
       // Load speaker suggestions
       setSpeakerSuggestions(data.unknown_speaker_suggestions || [])
 
-      // Start with corrections phase
-      setReviewPhase('corrections')
+      // Load speaker name assignments
+      const loadedNames = data.speaker_names || {}
+      setSpeakerNames(loadedNames)
+
+      // Determine if speaker names are complete
+      const allSpeakersNamed = data.known_speakers?.length > 0 &&
+        data.known_speakers.every(s => loadedNames[s] && loadedNames[s].trim() !== '')
+      setSpeakerNamesComplete(allSpeakersNamed)
+
+      // Determine starting phase based on completion
+      const speakerReviewPending = (data.unknown_speaker_suggestions || []).some(s => s.status === 'pending')
+      const correctionsPending = data.corrections.some(c => c.status === 'pending')
+
+      let startPhase = 'assign-names'
+      let startIndex = 0
+
+      if (allSpeakersNamed) {
+        if (speakerReviewPending && (data.unknown_speaker_suggestions || []).length > 0) {
+          startPhase = 'speakers'
+          startIndex = (data.unknown_speaker_suggestions || []).findIndex(s => s.status === 'pending')
+          if (startIndex < 0) startIndex = 0
+        } else {
+          startPhase = 'corrections'
+          startIndex = data.corrections.findIndex(c => c.status === 'pending')
+          if (startIndex < 0) startIndex = 0
+        }
+      }
+
+      setReviewPhase(startPhase)
+      setCurrentIndex(startIndex)
       setShowFileBrowser(false)
     } catch (err) {
       setError(err.message)
@@ -114,7 +144,8 @@ function App() {
         body: JSON.stringify({
           video_path: videoPath,
           corrections: corrections,
-          speaker_decisions: speakerSuggestions
+          speaker_decisions: speakerSuggestions,
+          speaker_names: speakerNames
         })
       })
 
@@ -132,30 +163,6 @@ function App() {
     }
   }
 
-  // Export training data
-  const exportData = async () => {
-    if (!videoPath) return
-
-    try {
-      await saveProgress()
-
-      const response = await fetch(`${API_BASE}/export`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_path: videoPath })
-      })
-
-      const data = await response.json()
-
-      if (data.error) {
-        throw new Error(data.error)
-      }
-
-      alert(`Exported ${data.pair_count} training pairs to:\n${data.training_file}`)
-    } catch (err) {
-      setError(err.message)
-    }
-  }
 
   // Update correction status
   const updateCorrection = useCallback((index, updates) => {
@@ -285,10 +292,15 @@ function App() {
       setKnownSpeakers(prev => [...prev, speaker].sort())
     }
 
+    // Add to speaker names if new (use speaker as its own display name)
+    if (!speakerNames[speaker]) {
+      setSpeakerNames(prev => ({ ...prev, [speaker]: speaker }))
+    }
+
     if (currentIndex < speakerSuggestions.length - 1) {
       setCurrentIndex(currentIndex + 1)
     }
-  }, [currentIndex, speakerSuggestions.length, knownSpeakers, updateSpeakerSuggestion])
+  }, [currentIndex, speakerSuggestions.length, knownSpeakers, speakerNames, updateSpeakerSuggestion])
 
   // Navigation handlers
   const handleNext = useCallback(() => {
@@ -308,6 +320,22 @@ function App() {
     setReviewPhase(phase)
     setCurrentIndex(0)
   }, [])
+
+  // Speaker names handlers
+  const handleUpdateSpeakerNames = useCallback((names) => {
+    setSpeakerNames(names)
+  }, [])
+
+  const handleSpeakerNamesComplete = useCallback(() => {
+    setSpeakerNamesComplete(true)
+    // Move to next phase
+    if (speakerSuggestions.length > 0) {
+      setReviewPhase('speakers')
+    } else {
+      setReviewPhase('corrections')
+    }
+    setCurrentIndex(0)
+  }, [speakerSuggestions.length])
 
   // Seek video to current item timestamp (1 second before for context)
   useEffect(() => {
@@ -475,11 +503,14 @@ function App() {
     }
   }, [wordChunk.chunk_start, wordChunk.chunk_end, fetchWordChunk])
 
-  // Handle transcript word click
-  const handleWordClick = useCallback((timestamp) => {
+  // Handle transcript word click (also used for speaker label clicks)
+  const handleWordClick = useCallback((timestamp, sentenceId = null) => {
     if (videoRef.current) {
       videoRef.current.currentTime = timestamp
       videoRef.current.play().catch(() => {})
+    }
+    if (sentenceId != null) {
+      setScrollToSentenceId(sentenceId)
     }
   }, [])
 
@@ -502,14 +533,42 @@ function App() {
         reviewPhase={reviewPhase}
         onPhaseSwitch={handlePhaseSwitch}
         hasSpeakerSuggestions={speakerSuggestions.length > 0}
+        speakerNamesComplete={speakerNamesComplete}
         onBrowse={() => setShowFileBrowser(true)}
         onSave={saveProgress}
-        onExport={exportData}
         saveStatus={saveStatus}
       />
 
-      <div className="main-content">
-        <div className="left-panel">
+      <div className="top-panel">
+        {reviewPhase === 'assign-names' ? (
+          <AssignSpeakersPanel
+            speakers={knownSpeakers}
+            speakerNames={speakerNames}
+            transcript={transcript}
+            onUpdateSpeakerNames={handleUpdateSpeakerNames}
+            onMarkComplete={handleSpeakerNamesComplete}
+            onSeek={handleWordClick}
+          />
+        ) : reviewPhase === 'speakers' ? (
+          <UnknownSpeakerPanel
+            suggestion={currentItem}
+            onMergeBefore={handleMergeBefore}
+            onMergeAfter={handleMergeAfter}
+            onKeepSeparate={handleKeepSeparate}
+            onAssignSpeaker={handleAssignSpeaker}
+          />
+        ) : (
+          <CorrectionPanel
+            correction={currentItem}
+            onAccept={handleAccept}
+            onReject={handleReject}
+            onIgnore={handleIgnore}
+          />
+        )}
+      </div>
+
+      <div className="lower-content">
+        <div className="lower-left">
           <VideoPlayer
             videoPath={videoPath}
             videoRef={videoRef}
@@ -519,35 +578,20 @@ function App() {
           />
         </div>
 
-        <div className="right-panel">
-          {reviewPhase === 'corrections' ? (
-            <CorrectionPanel
-              correction={currentItem}
-              onAccept={handleAccept}
-              onReject={handleReject}
-              onIgnore={handleIgnore}
-            />
-          ) : (
-            <UnknownSpeakerPanel
-              suggestion={currentItem}
-              onMergeBefore={handleMergeBefore}
-              onMergeAfter={handleMergeAfter}
-              onKeepSeparate={handleKeepSeparate}
-              onAssignSpeaker={handleAssignSpeaker}
-            />
-          )}
+        <div className="lower-right">
+          <TranscriptView
+            transcript={transcript}
+            corrections={corrections}
+            speakerNames={speakerNames}
+            speakerSuggestions={speakerSuggestions}
+            currentCorrection={reviewPhase === 'corrections' ? currentItem : null}
+            currentSpeakerSuggestion={reviewPhase === 'speakers' ? currentItem : null}
+            scrollToSentenceId={scrollToSentenceId}
+            videoTime={videoTime}
+            wordChunk={wordChunk}
+            onWordClick={handleWordClick}
+          />
         </div>
-      </div>
-
-      <div className="transcript-section">
-        <TranscriptView
-          transcript={transcript}
-          currentCorrection={reviewPhase === 'corrections' ? currentItem : null}
-          currentSpeakerSuggestion={reviewPhase === 'speakers' ? currentItem : null}
-          videoTime={videoTime}
-          wordChunk={wordChunk}
-          onWordClick={handleWordClick}
-        />
       </div>
 
       <NavigationBar
